@@ -1,0 +1,7 @@
+{
+  "name": "gem-trade-internal-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node local-server.mjs", "test": "node --test tests/*.test.mjs" },
+  "dependencies": { "ws": "^8.18.3" }
+}

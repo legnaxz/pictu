@@ -1,0 +1,7 @@
+.vercel
+.env*
+node_modules
+
+# 루트 roBrowser .gitignore가 "index.html"을 전역 빌드 산출물로 무시하지만,
+# 이 프로젝트에서는 손으로 작성한 진입점 소스이므로 예외 처리한다.
+!index.html

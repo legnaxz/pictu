@@ -1,0 +1,55 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "index.html",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "style.css",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "app.js",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "rules.js",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "tutorial.js",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "ai.js",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "fx.js",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "assets/*",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "api/ws.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/ws",
+      "dest": "/api/ws.js"
+    },
+    {
+      "src": "/",
+      "dest": "/index.html"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/$1"
+    }
+  ]
+}
