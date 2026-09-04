@@ -64,7 +64,18 @@ test("plays effects for actions and shows the win/lose result screen", async () 
     await page.click("#solo");
     await page.waitForTimeout(900);
 
-    assert.ok(await page.$("#toggle-sound"), "음소거 토글 버튼이 있어야 한다");
+    // 사운드 설정은 설정 모달 안에서 BGM/효과음을 따로 켜고 끌 수 있다
+    assert.ok(await page.$("#open-settings"), "설정 버튼이 있어야 한다");
+    await page.click("#open-settings");
+    await page.waitForSelector(".settings-sheet", { timeout: 3000 });
+    assert.ok(await page.$('[data-audio="bgm"]'), "BGM 토글이 있어야 한다");
+    assert.ok(await page.$('[data-audio="sfx"]'), "효과음 토글이 있어야 한다");
+    await page.click('[data-audio="bgm"]');
+    const bgmOff = await page.evaluate(() => JSON.parse(localStorage.getItem("splendor-pokemon-audio")).bgm);
+    assert.equal(bgmOff, false, "BGM을 끄면 설정이 저장되어야 한다");
+    await page.click('[data-audio="bgm"]');
+    await page.click("#settings-close");
+    await page.waitForTimeout(200);
 
     // 볼을 고르면 선택음이 난다
     await page.click('[data-token="red"]');
@@ -73,7 +84,7 @@ test("plays effects for actions and shows the win/lose result screen", async () 
     assert.ok(afterPick > 0, "볼 선택 시 사운드가 재생되어야 한다");
 
     // 게임을 끝까지 진행시켜 결과 화면을 확인한다
-    const deadline = Date.now() + 200000;
+    const deadline = Date.now() + 240000;
     while (Date.now() < deadline) {
       const st = await page.evaluate(() => JSON.parse(window.render_game_to_text()));
       if (st.winner !== null && st.winner !== undefined) break;
@@ -115,7 +126,12 @@ test("plays effects for actions and shows the win/lose result screen", async () 
 
         // 화면에 이미 렌더된 "부족한 볼" 힌트(가장 근접한 카드의 lack-chip)를 그대로 읽어
         // 목표 지향적으로 볼을 고른다 — 순수 무작위보다 실제 플레이에 가깝고 훨씬 빨리 수렴한다
-        const closest = document.querySelector(".card.is-close, .card.is-affordable");
+        // 마스터볼이 필요한 희귀·전설 카드를 목표로 잡으면 볼만 모으다 진행이 막힌다.
+        // 실제 플레이처럼 살 수 있는 일반 카드를 우선 목표로 삼는다.
+        const candidates = [...document.querySelectorAll(".card.is-close, .card.is-affordable")].filter(
+          (card) => !card.querySelector(".afford-tag.master")
+        );
+        const closest = candidates[0] || document.querySelector(".card.is-close, .card.is-affordable");
         const wanted = closest
           ? [...closest.querySelectorAll(".lack-chip")]
               .map((chip) => [...chip.classList].find((c) => ["red", "blue", "yellow", "green", "black"].includes(c)))

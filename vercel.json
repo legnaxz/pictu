@@ -34,6 +34,10 @@
       "use": "@vercel/static"
     },
     {
+      "src": "room-server.mjs",
+      "use": "@vercel/static"
+    },
+    {
       "src": "api/ws.js",
       "use": "@vercel/node"
     }

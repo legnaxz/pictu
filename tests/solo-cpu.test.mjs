@@ -49,7 +49,7 @@ test("solo CPU mode supports 2-4 players, difficulty switching, and auto turn ex
     assert.match(badgeText, /3인/);
 
     // Check player cards: 3 players rendered
-    const playerCards = await page.$$(".player-card");
+    const playerCards = await page.$$(".trainer-card");
     assert.equal(playerCards.length, 3);
 
     // Player 1 should have (나)
@@ -76,8 +76,9 @@ test("solo CPU mode supports 2-4 players, difficulty switching, and auto turn ex
     }, { timeout: 6000 });
 
     const updatedTurnText = await page.textContent(".status-badge");
-    assert.match(updatedTurnText, /지우의 턴/);
-    const myCard = await page.textContent(".player-card");
+    // 내 차례는 이름 대신 "내 차례"로 분명히 표시한다
+    assert.match(updatedTurnText, /내 차례/);
+    const myCard = await page.textContent(".trainer-card");
     assert.match(myCard, /\(나\)/, "내 자리에는 (나) 표시가 붙는다");
 
     // Check game log mentions CPU action

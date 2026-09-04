@@ -9,15 +9,61 @@ const session = {
   socket: null,
   seat: 0,
   code: null,
+  token: null,
   online: false,
   isSolo: false,
   host: false,
   capacity: 0,
   connected: 0,
+  seatStates: [],
+  revision: 0,
+  // "connecting" | "online" | "reconnecting" | "lost"
+  link: "online",
   view: "board",
   mobileTab: "market",
   tutorialStep: null,
+  settingsOpen: false,
+  // 모바일에서 카드를 눌렀을 때 올라오는 바텀시트의 대상 카드
+  cardSheet: null,
+  myTab: "collection",
 };
+
+const SESSION_KEY = "splendor-pokemon-session";
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+
+function saveSession() {
+  if (!session.online || !session.code || !session.token) return;
+  try {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ code: session.code, seat: session.seat, token: session.token, at: Date.now() })
+    );
+  } catch {
+    /* 저장이 막혀 있어도 게임 자체는 계속되어야 한다 */
+  }
+}
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const saved = JSON.parse(raw);
+    // 서버 자리 유예(10분)보다 넉넉히 잡되, 며칠 지난 세션은 되살리지 않는다
+    if (!saved?.code || !saved?.token || Date.now() - (saved.at || 0) > 12 * 60 * 60 * 1000) return null;
+    return saved;
+  } catch {
+    return null;
+  }
+}
+
+function clearSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {
+    /* 무시 */
+  }
+}
 
 const CPU_SPEEDS = {
   slow: { label: "느림", icon: "🐢", delay: 2400 },
@@ -75,6 +121,7 @@ function act(sound, run, { source = null, onSuccess = null } = {}) {
   }
 
   fx.play(sound);
+  session.cardSheet = null;
   if (onSuccess) onSuccess();
 
   // 배지 선점은 규칙 엔진이 턴 종료 시 자동 처리하므로 사후에 감지한다
@@ -219,6 +266,8 @@ function startGame(count, isSolo = false) {
   selectedTokens = [];
   reserveMode = false;
   session.tutorialStep = null;
+  // 게임 시작 클릭은 사용자 제스처이므로 이 시점에 오디오를 열 수 있다
+  fx.unlockAudio();
   render();
   sync();
   checkAndTriggerCpu();
@@ -262,11 +311,11 @@ function evolutionCost(player, card) {
 function costMarkup(cost, masterRequired = false) {
   const items = [];
   if (masterRequired) {
-    items.push(`<span class="cost-chip wild"><span class="chip-dot"></span>1</span>`);
+    items.push(`<span class="cost-chip wild"><span class="chip-dot"></span><b class="cost-num">1</b></span>`);
   }
   COLORS.forEach((c) => {
     if (cost[c]) {
-      items.push(`<span class="cost-chip ${c}"><span class="chip-dot"></span>${cost[c]}</span>`);
+      items.push(`<span class="cost-chip ${c}"><span class="chip-dot"></span><b class="cost-num">${cost[c]}</b></span>`);
     }
   });
   return items.join("");
@@ -357,6 +406,75 @@ function cardMarkup(card, firstTarget, context = "market") {
   `;
 }
 
+function settingsMarkup() {
+  if (!session.settingsOpen) return "";
+  const audio = fx.getAudioPrefs();
+  return `
+    <div class="settings-backdrop" id="settings-backdrop">
+      <section class="settings-sheet" role="dialog" aria-label="설정">
+        <header class="settings-head">
+          <h3>⚙️ 설정</h3>
+          <button class="settings-close" id="settings-close" aria-label="닫기">✕</button>
+        </header>
+
+        <div class="settings-group">
+          <span class="settings-label">🎵 사운드</span>
+          <p class="settings-hint">이 설정은 내 기기에만 적용됩니다. 다른 트레이너에게는 영향을 주지 않아요.</p>
+          <button class="settings-toggle ${audio.bgm ? "on" : ""}" data-audio="bgm">
+            <span>배경음악 (BGM)</span>
+            <span class="toggle-pill">${audio.bgm ? "켜짐" : "꺼짐"}</span>
+          </button>
+          <button class="settings-toggle ${audio.sfx ? "on" : ""}" data-audio="sfx">
+            <span>효과음</span>
+            <span class="toggle-pill">${audio.sfx ? "켜짐" : "꺼짐"}</span>
+          </button>
+        </div>
+
+        ${
+          session.isSolo
+            ? `<div class="settings-group">
+                 <span class="settings-label">⏱️ CPU 진행 속도</span>
+                 <div class="settings-row">
+                   ${CPU_SPEED_ORDER.map(
+                     (id) => `<button class="settings-choice ${soloSettings.cpuSpeed === id ? "on" : ""}" data-speed="${id}">
+                       ${CPU_SPEEDS[id].icon} ${CPU_SPEEDS[id].label}
+                     </button>`
+                   ).join("")}
+                 </div>
+               </div>`
+            : ""
+        }
+
+        <div class="settings-group">
+          <span class="settings-label">🖥️ 화면</span>
+          <div class="settings-row">
+            <button class="settings-choice ${session.view === "board" ? "on" : ""}" data-view="board">보드</button>
+            <button class="settings-choice ${session.view === "tui" ? "on" : ""}" data-view="tui">TUI</button>
+          </div>
+        </div>
+
+        <button class="settings-exit" id="btn-home">🏠 로비로 나가기</button>
+      </section>
+    </div>`;
+}
+
+function linkBannerMarkup() {
+  if (!session.online || session.link === "online") return "";
+  if (session.link === "lost") {
+    return `
+      <div class="link-banner lost">
+        <span>세션이 만료되어 자리를 잃었습니다.</span>
+        <button id="link-retry" class="link-retry">다시 시도</button>
+        <button id="link-home" class="link-retry ghost">로비로</button>
+      </div>`;
+  }
+  return `
+    <div class="link-banner ${session.link}">
+      <span class="link-spinner"></span>
+      <span>${session.link === "reconnecting" ? "연결이 끊겼습니다. 다시 잇는 중…" : "연결 중…"}</span>
+    </div>`;
+}
+
 function collectionMarkup() {
   const me = state.players[session.seat];
   if (!me) return "";
@@ -406,6 +524,238 @@ function collectionMarkup() {
       </div>
     </section>
   `;
+}
+
+/**
+ * 포켓볼 공급처. 데스크톱 우측과 모바일 하단 트레이가 같은 마크업을 쓴다.
+ * 남은 개수를 점으로 시각화해 "얼마나 남았는지"를 숫자보다 빠르게 읽게 한다.
+ */
+function supplyMarkup({ compact = false } = {}) {
+  const me = current();
+  const threshold = perk(me, "sameColorThreshold", 4);
+  const blocked = !isMine() || Boolean(state.pending) || state.finished;
+
+  const ball = (c) => {
+    const left = state.bank[c];
+    const picked = selectedTokens.filter((t) => t === c).length;
+    const max = state.playerCount === 2 ? 4 : state.playerCount === 3 ? 5 : 7;
+    return `
+      <button class="ball-token-btn ${c} ${picked ? "selected-token" : ""} ${left < 1 ? "depleted" : ""}"
+              data-token="${c}"
+              title="${left < 1 ? `${labels[c]} 소진` : `${labels[c]} · ${left}개 남음`}"
+              ${blocked || left < 1 ? "disabled" : ""}>
+        <span class="chip-ball ${c}"><span class="chip-dot"></span></span>
+        <span class="ball-meta">
+          <span class="ball-name">${labels[c]}</span>
+          <b class="ball-count">${left}</b>
+        </span>
+        <span class="ball-gauge" aria-hidden="true">
+          ${Array.from({ length: max }, (_, i) => `<i class="${i < left ? "on" : ""}"></i>`).join("")}
+        </span>
+        ${picked ? `<span class="ball-picked">+${picked}</span>` : ""}
+      </button>`;
+  };
+
+  return `
+    <section class="supply-box ${compact ? "compact" : ""}">
+      ${compact ? "" : `<p class="supply-tip">서로 다른 색 3개 · 또는 ${threshold}개 이상 남은 같은 색 2개</p>`}
+      <div class="supply-grid">${COLORS.map(ball).join("")}</div>
+      <div class="supply-wild" title="카드를 손에 보관하면 얻습니다">
+        <span class="chip-ball wild"><span class="chip-dot"></span></span>
+        <span class="ball-name">마스터볼</span>
+        <b class="ball-count">${state.bank.wild}</b>
+        <span class="wild-note">희귀·전설 포획 전용</span>
+      </div>
+    </section>`;
+}
+
+/** 내 도감 / 보관함을 탭으로 묶는다. */
+function myPanelMarkup() {
+  const me = state.players[session.seat];
+  if (!me) return "";
+  const reserveLimit = perk(me, "reserveLimit", 3);
+  const isCollection = session.myTab === "collection";
+
+  return `
+    <div class="my-panel">
+      <div class="my-tabs">
+        <button class="my-tab ${isCollection ? "on" : ""}" data-mytab="collection">
+          📕 내 도감 <b>${me.cards.length + me.evolutions.length}</b>
+        </button>
+        <button class="my-tab ${isCollection ? "" : "on"}" data-mytab="reserve">
+          🎒 보관함 <b>${me.reserved.length}/${reserveLimit}</b>
+        </button>
+      </div>
+      ${isCollection ? collectionMarkup() : reserveBoxMarkup()}
+    </div>`;
+}
+
+function reserveBoxMarkup() {
+  const me = state.players[session.seat];
+  const firstTarget = target();
+  return `
+    <section class="my-reserve-box">
+      ${
+        me.reserved.length
+          ? `<div class="reserved-cards-list">${me.reserved
+              .map((c) => cardMarkup(c, firstTarget, "reserved"))
+              .join("")}</div>`
+          : `<div class="empty-reserve-slot">
+               보관한 포켓몬이 없습니다<br />
+               <small>카드를 보관하면 마스터볼을 받습니다</small>
+             </div>`
+      }
+    </section>`;
+}
+
+/** 모바일에서 카드를 누르면 올라오는 바텀시트. 엄지로 닿는 위치에 큰 버튼을 둔다. */
+function cardSheetMarkup() {
+  if (!session.cardSheet) return "";
+  const all = Object.values(state.market).flat().concat(state.players[session.seat]?.reserved || []);
+  const card = all.find((c) => c.id === session.cardSheet);
+  if (!card) return "";
+
+  const me = current();
+  const afford = me ? affordability(me, card) : null;
+  const isSpecial = card.kind !== "normal";
+  const inReserve = (state.players[session.seat]?.reserved || []).some((c) => c.id === card.id);
+  const canAct = isMine() && !state.pending && !state.finished;
+  const reserveFull = me ? me.reserved.length >= perk(me, "reserveLimit", 3) : false;
+  const stageLabel = card.kind === "rare" ? "희귀" : card.kind === "legend" ? "전설·환상" : `${card.stage}단계`;
+
+  return `
+    <div class="card-sheet-backdrop" id="card-sheet-backdrop">
+      <section class="card-sheet ${card.bonus}">
+        <span class="sheet-grip"></span>
+        <div class="sheet-head">
+          <img class="sheet-art" src="${card.artwork}" alt="${card.name}" />
+          <div class="sheet-info">
+            <b class="sheet-name">${card.name}</b>
+            <span class="sheet-stage">${stageLabel} · 보너스 ${labels[card.bonus]} ×${card.bonusCount}</span>
+            <span class="sheet-points">★${card.points}</span>
+          </div>
+        </div>
+
+        <div class="sheet-cost">
+          <span class="sheet-cost-label">필요한 볼</span>
+          <div class="sheet-cost-chips">${costMarkup(afford ? afford.cost : card.cost, card.masterRequired)}</div>
+        </div>
+
+        <div class="sheet-afford">${afford ? shortfallMarkup(afford, card) : ""}</div>
+
+        <div class="sheet-actions">
+          <button class="sheet-btn buy" data-buy="${card.id}" ${canAct && afford?.canBuy ? "" : "disabled"}>
+            ⚡ 잡기
+          </button>
+          <button class="sheet-btn reserve" data-reserve-card="${card.id}"
+                  ${canAct && !isSpecial && !reserveFull && !inReserve ? "" : "disabled"}>
+            🎒 보관
+          </button>
+        </div>
+        <button class="sheet-close" id="card-sheet-close">닫기</button>
+      </section>
+    </div>`;
+}
+
+function trainerCardMarkup(p) {
+  const trainer = TRAINERS.find((t) => t.id === p.trainerId);
+  const isMe = p.seat === session.seat;
+  const isActive = p.seat === state.active && !state.finished;
+  const owned = p.cards.concat(p.evolutions);
+  const reserveLimit = perk(p, "reserveLimit", 3);
+  const progress = Math.min(100, Math.round((p.score / WIN_SCORE) * 100));
+  const seatState = session.online ? session.seatStates.find((entry) => entry.seat === p.seat) : null;
+
+  return `
+    <article class="trainer-card ${isActive ? "active" : ""} ${isMe ? "me" : ""}" data-seat="${p.seat}" tabindex="0">
+      <div class="tc-top">
+        <span class="tc-avatar">${p.avatar || "🎽"}</span>
+        <div class="tc-id">
+          <b class="tc-name">${p.name}${isMe ? " (나)" : ""}</b>
+          <span class="tc-title">
+            ${trainer?.title || ""}
+            ${p.isCpu ? `<span class="cpu-tag">${p.difficultyLabel || "CPU"}</span>` : ""}
+          </span>
+        </div>
+        <div class="tc-score-wrap">
+          <span class="tc-score ${p.score >= WIN_SCORE - 3 ? "near" : ""}">★${p.score}</span>
+          <span class="tc-goal">/${WIN_SCORE}</span>
+        </div>
+      </div>
+
+      <div class="tc-progress"><span style="width:${progress}%"></span></div>
+
+      <div class="tc-bonuses">
+        ${COLORS.map(
+          (c) => `<span class="tc-bonus ${c} ${p.bonuses[c] ? "has" : ""}" title="${labels[c]} 보너스 ${p.bonuses[c]}개">
+            <i class="tc-dot"></i>${p.bonuses[c]}
+          </span>`
+        ).join("")}
+        <span class="tc-bonus wild ${p.tokens.wild ? "has" : ""}" title="보유 마스터볼 ${p.tokens.wild}개">
+          <i class="tc-dot"></i>${p.tokens.wild}
+        </span>
+      </div>
+
+      <div class="tc-meta">
+        <span title="포획한 포켓몬">🃏 ${p.cards.length}</span>
+        <span title="진화시킨 포켓몬">🧬 ${p.evolutions.length}</span>
+        <span title="손에 보관 중">🎒 ${p.reserved.length}/${reserveLimit}</span>
+        <span class="tc-badges" title="획득한 체육관 배지">${p.badges.map((b) => b.icon).join("") || "🏅 0"}</span>
+      </div>
+
+      ${
+        isActive && p.isCpu
+          ? `<div class="cpu-thinking-pill"><span>⚡ 수 계산 중...</span></div>`
+          : ""
+      }
+      ${
+        seatState && !seatState.online
+          ? `<div class="tc-offline">📴 접속 끊김 — 자리 유지 중</div>`
+          : ""
+      }
+
+      <!-- 호버·포커스 시 펼쳐지는 상세 -->
+      <div class="tc-detail">
+        <div class="tcd-head">
+          <span>${p.avatar || "🎽"} ${p.name}</span>
+          <span class="tcd-perk">${trainer?.title || ""}</span>
+        </div>
+        <p class="tcd-desc">${trainer?.desc || ""}</p>
+        <div class="tcd-row">
+          <span class="tcd-label">보유 볼</span>
+          <div class="tcd-tokens">
+            ${COLORS.map((c) => `<span class="tcd-token ${c}">${p.tokens[c]}</span>`).join("")}
+            <span class="tcd-token wild">M${p.tokens.wild}</span>
+          </div>
+        </div>
+        <div class="tcd-row">
+          <span class="tcd-label">포획 ${owned.length}장</span>
+          <div class="tcd-cards">
+            ${
+              owned.length
+                ? owned
+                    .slice(-12)
+                    .map(
+                      (card) =>
+                        `<span class="tcd-card ${card.kind !== "normal" ? "special" : ""}" title="${card.name} ★${card.points}">
+                          <img src="${card.artwork}" alt="${card.name}" loading="lazy" />
+                        </span>`
+                    )
+                    .join("")
+                : `<span class="tcd-empty">아직 없음</span>`
+            }
+          </div>
+        </div>
+        ${
+          p.badges.length
+            ? `<div class="tcd-row">
+                 <span class="tcd-label">배지</span>
+                 <div class="tcd-badges">${p.badges.map((b) => `<span title="${b.name}">${b.icon} ${b.name}</span>`).join("")}</div>
+               </div>`
+            : ""
+        }
+      </div>
+    </article>`;
 }
 
 function badgeStripMarkup() {
@@ -533,16 +883,15 @@ function renderBoard() {
   const firstTarget = target();
   const tutModalHtml = session.tutorialStep !== null ? renderTutorialModal(session.tutorialStep) : "";
   const currentDiffPreset = DIFFICULTY_PRESETS.find((d) => d.id === soloSettings.difficulty) || DIFFICULTY_PRESETS[1];
+  const me = state.players[session.seat];
+  const myTurn = isMine() && !state.pending && !state.finished;
 
   let modeBadge = "솔로 규칙 연습";
-  if (session.online) {
-    modeBadge = `온라인 ${session.code} · ${session.seat + 1}번 자리`;
-  } else if (session.isSolo) {
-    modeBadge = `🤖 CPU 대전 · ${state.playerCount}인 (${currentDiffPreset.label})`;
-  }
+  if (session.online) modeBadge = `온라인 ${session.code} · ${session.seat + 1}번 자리`;
+  else if (session.isSolo) modeBadge = `🤖 CPU 대전 · ${state.playerCount}인 (${currentDiffPreset.label})`;
 
   app.innerHTML = `
-    <section class="game ${session.mobileTab ? `tab-${session.mobileTab}` : ""}">
+    <section class="game ${session.mobileTab ? `tab-${session.mobileTab}` : ""} ${myTurn ? "my-turn" : ""}">
       <header class="topbar">
         <div class="brand-group">
           <h1><span>스플렌더</span> 포켓몬</h1>
@@ -551,23 +900,32 @@ function renderBoard() {
 
         <div class="topbar-actions">
           <button class="rulebook-btn" id="open-rulebook">🎓 룰북</button>
-          <button class="sound-btn" id="toggle-sound" title="${fx.isMuted() ? "소리 켜기" : "소리 끄기"}">${fx.isMuted() ? "🔇" : "🔊"}</button>
-          ${
-            session.isSolo
-              ? `<button class="sound-btn cpu-speed-btn" id="toggle-cpu-speed" title="CPU 진행 속도: ${CPU_SPEEDS[soloSettings.cpuSpeed].label} (클릭해서 변경)">${CPU_SPEEDS[soloSettings.cpuSpeed].icon} ${CPU_SPEEDS[soloSettings.cpuSpeed].label}</button>`
-              : ""
-          }
-          <button class="btn-new-game" id="btn-home">🏠 로비</button>
-          <div class="view-switch">
-            <button data-view="board" class="selected">보드</button>
-            <button data-view="tui">TUI</button>
-          </div>
+          <button class="icon-btn" id="open-settings" title="설정" aria-label="설정">⚙️</button>
         </div>
 
-        <div class="status-badge ${state.finished ? "finished" : ""}">
-          ${state.finished ? `🏆 ${state.players[state.winner].name} 승리!` : `🎯 ${current().name}의 턴 · ${state.turn}R`}
+        <div class="status-badge ${state.finished ? "finished" : ""} ${myTurn ? "mine" : ""}">
+          ${
+            state.finished
+              ? `🏆 ${state.players[state.winner].name} 승리!`
+              : myTurn
+                ? `🎯 내 차례 · ${state.turn}R`
+                : `⏳ ${current().name}의 차례 · ${state.turn}R`
+          }
         </div>
       </header>
+
+      ${linkBannerMarkup()}
+
+      <!-- 모바일 요약 바: 내 점수와 보너스를 항상 보이게 -->
+      <div class="mobile-me" id="mobile-me">
+        <span class="mm-avatar">${me?.avatar || "🎽"}</span>
+        <span class="mm-score">★${me?.score ?? 0}<i>/${WIN_SCORE}</i></span>
+        <div class="mm-bonuses">
+          ${COLORS.map((c) => `<span class="mm-b ${c} ${me?.bonuses[c] ? "has" : ""}">${me?.bonuses[c] ?? 0}</span>`).join("")}
+          <span class="mm-b wild ${me?.tokens.wild ? "has" : ""}">M${me?.tokens.wild ?? 0}</span>
+        </div>
+        <span class="mm-more">👤 상세</span>
+      </div>
 
       <!-- 모바일 탭 바 -->
       <nav class="mobile-nav" aria-label="모바일 보기 탭">
@@ -578,53 +936,15 @@ function renderBoard() {
       </nav>
 
       <div class="board-layout">
-        <!-- 좌측 레일: 트레이너 목록 -->
+        <!-- 좌측: 트레이너 현황판 -->
         <aside class="left-rail rail-panel">
           <div class="rail-title">트레이너 현황</div>
           <section class="players">
-            ${state.players
-              .map(
-                (p) => `
-              <article class="player-card ${p.seat === state.active && !state.finished ? "active" : ""}" data-seat="${p.seat}">
-                <div class="player-head">
-                  <span class="player-name">
-                    ${p.avatar ? `${p.avatar} ` : ""}${p.name}${p.seat === session.seat ? " (나)" : ""}
-                    ${p.isCpu ? `<span class="cpu-tag ${p.difficultyLabel || "중급"}">${p.difficultyLabel || "CPU"}</span>` : ""}
-                  </span>
-                  <span class="player-score ${p.score >= WIN_SCORE - 3 ? "near-win" : ""}">★ ${p.score}<small>/${WIN_SCORE}</small></span>
-                </div>
-                ${p.seat === state.active && p.isCpu && !state.finished ? `<div class="cpu-thinking-pill"><span>⚡ 수 계산 중...</span></div>` : ""}
-                <div class="player-trainer">
-                  <span class="trainer-title">${TRAINERS.find((t) => t.id === p.trainerId)?.title || ""}</span>
-                  <span class="trainer-perk" title="${TRAINERS.find((t) => t.id === p.trainerId)?.desc || ""}">특전</span>
-                </div>
-                <div class="player-stats">
-                  <span>포획 ${p.cards.length} · 진화 ${p.evolutions.length} · 손 ${p.reserved.length}/${perk(p, "reserveLimit", 3)}</span>
-                </div>
-                ${
-                  p.badges.length
-                    ? `<div class="player-badges">${p.badges.map((b) => `<span class="mini-badge" title="${b.name}">${b.icon}</span>`).join("")}</div>`
-                    : ""
-                }
-                <div class="player-bonus-row">
-                  <span class="sub-label">보너스</span>
-                  <div class="bonus-chips">${bonusMarkup(p.bonuses)}</div>
-                </div>
-                <div class="player-tokens-row">
-                  <span class="sub-label">보유 볼</span>
-                  <div class="mini-tokens">
-                    ${COLORS.map((c) => `<span class="token-pill ${c}">${p.tokens[c]}</span>`).join("")}
-                    <span class="token-pill wild" title="마스터볼">M ${p.tokens.wild}</span>
-                  </div>
-                </div>
-              </article>
-            `
-              )
-              .join("")}
+            ${state.players.map(trainerCardMarkup).join("")}
           </section>
         </aside>
 
-        <!-- 중앙 메인: 포켓몬 시장 -->
+        <!-- 중앙: 포켓몬 시장 -->
         <main class="table-area">
           <div class="market-header">
             <div>
@@ -636,27 +956,24 @@ function renderBoard() {
 
           ${
             firstTarget
-              ? `
-            <div class="guide-callout">
-              <strong>💡 첫 포획 추천 가이드</strong>: <b>${firstTarget.name}</b>에 필요한 볼 <span class="inline-chips">${costMarkup(firstTarget.cost)}</span>을(를) 모아보세요!
-            </div>
-          `
+              ? `<div class="guide-callout">
+                   <strong>💡 첫 포획 추천</strong>: <b>${firstTarget.name}</b>에 필요한 볼
+                   <span class="inline-chips">${costMarkup(firstTarget.cost)}</span>을(를) 모아보세요!
+                 </div>`
               : ""
           }
 
           ${badgeStripMarkup()}
-
           ${pendingMarkup()}
 
-          <!-- 특수 시장: 희귀 / 전설·환상 -->
           <section class="special-market-row">
             <div class="special-market-col">
               <div class="tier-heading rare-heading">
-                <span>🌟 희귀 포켓몬 (마스터볼 필수)</span>
-                <small>더블 보너스</small>
+                <span>🌟 희귀 포켓몬</span>
+                <small>마스터볼 필수 · 더블 보너스</small>
               </div>
               <div class="special-cards-deck">
-                <div class="deck-card rare-deck" title="희귀 덱 남은 카드: ${state.decks.rare.length}장">
+                <div class="deck-card rare-deck" title="희귀 덱 남은 카드 ${state.decks.rare.length}장">
                   <div class="deck-inner">
                     <span class="deck-badge">RARE</span>
                     <span class="deck-count">${state.decks.rare.length}</span>
@@ -670,11 +987,11 @@ function renderBoard() {
 
             <div class="special-market-col">
               <div class="tier-heading legend-heading">
-                <span>👑 전설·환상 포켓몬 (마스터볼 필수)</span>
-                <small>더블 보너스</small>
+                <span>👑 전설·환상 포켓몬</span>
+                <small>마스터볼 필수 · 더블 보너스</small>
               </div>
               <div class="special-cards-deck">
-                <div class="deck-card legend-deck" title="전설 덱 남은 카드: ${state.decks.legend.length}장">
+                <div class="deck-card legend-deck" title="전설 덱 남은 카드 ${state.decks.legend.length}장">
                   <div class="deck-inner">
                     <span class="deck-badge">LEGEND</span>
                     <span class="deck-count">${state.decks.legend.length}</span>
@@ -687,14 +1004,15 @@ function renderBoard() {
             </div>
           </section>
 
-          <!-- 일반 시장: 3단계, 2단계, 1단계 -->
           <section class="tier-market-list">
             ${[3, 2, 1]
               .map(
                 (tier) => `
               <div class="tier-row tier-${tier}">
                 <div class="tier-deck-side">
-                  <button class="deck-card tier-deck" data-reserve-tier="${tier}" ${!isMine() || state.pending || state.finished || current().reserved.length >= perk(current(), "reserveLimit", 3) ? "disabled" : ""} title="${tier}단계 덱 맨 위 카드를 보지 않고 손에 보관 (마스터볼 획득)">
+                  <button class="deck-card tier-deck" data-reserve-tier="${tier}"
+                          ${!isMine() || state.pending || state.finished || me.reserved.length >= perk(me, "reserveLimit", 3) ? "disabled" : ""}
+                          title="${tier}단계 덱 맨 위 카드를 보지 않고 보관 (마스터볼 획득)">
                     <div class="deck-inner">
                       <span class="deck-badge">${tier}단계</span>
                       <span class="deck-count">${state.decks[tier].length}</span>
@@ -705,80 +1023,48 @@ function renderBoard() {
                 <div class="tier-cards-grid">
                   ${state.market[tier].map((c) => cardMarkup(c, firstTarget)).join("")}
                 </div>
-              </div>
-            `
+              </div>`
               )
               .join("")}
           </section>
         </main>
 
-        <!-- 우측 레일: 공급처 및 내 현황 -->
+        <!-- 우측: 공급처 + 내 현황 -->
         <aside class="right-rail rail-panel">
           <div class="rail-title">포켓볼 공급처</div>
-          <section class="supply-box">
-            <p class="supply-tip">서로 다른 색 3개 또는 4개 이상 남은 같은 색 2개</p>
-            <div class="supply-grid">
-              ${COLORS.map(
-                (c) => `
-                <button class="ball-token-btn ${c} ${selectedTokens.includes(c) ? "selected-token" : ""}"
-                        data-token="${c}"
-                        ${!isMine() || state.pending || state.finished ? "disabled" : ""}>
-                  <div class="chip-ball ${c}">
-                    <span class="chip-dot"></span>
-                  </div>
-                  <div class="ball-meta">
-                    <span class="ball-name">${labels[c]}</span>
-                    <b class="ball-count">${state.bank[c]}</b>
-                  </div>
-                </button>
-              `
-              ).join("")}
-            </div>
+          ${supplyMarkup()}
 
-            <div class="wild-supply">
-              <div class="ball-token-btn wild-token disabled" title="보관 시에만 획득 가능">
-                <div class="chip-ball wild">
-                  <span class="chip-dot"></span>
-                </div>
-                <div class="ball-meta">
-                  <span class="ball-name">마스터볼</span>
-                  <b class="ball-count">${state.bank.wild}</b>
-                </div>
-              </div>
-              <small class="wild-desc">카드 보관 시 1개 획득 · <b>희귀·전설 포획 전용</b> (일반 포켓몬에는 사용 불가)</small>
-            </div>
-          </section>
-
-          ${collectionMarkup()}
-
-          <div class="rail-title">내 보관함 & 예약</div>
-          <section class="my-reserve-box">
-            <div class="reserve-header">
-              <span>손에 보관한 포켓몬 (${state.players[session.seat].reserved.length}/${perk(state.players[session.seat], "reserveLimit", 3)})</span>
-            </div>
-            <div class="reserved-cards-list">
-              ${
-                state.players[session.seat].reserved.length
-                  ? state.players[session.seat].reserved.map((c) => cardMarkup(c, firstTarget, "reserved")).join("")
-                  : `<div class="empty-reserve-slot">보관된 포켓몬이 없습니다</div>`
-              }
-            </div>
-          </section>
+          <div class="rail-title">내 현황</div>
+          ${myPanelMarkup()}
 
           <div class="rail-title">게임 로그</div>
-          <div class="game-log-box">
-            <p>${state.log}</p>
-          </div>
+          <div class="game-log-box"><p>${state.log}</p></div>
         </aside>
       </div>
 
-      <!-- 플로팅 바텀 독 (조작 버튼) -->
+      <!-- 하단 조작 독: 모바일에서는 공급처가 여기 상시 노출되어 한 손으로 조작한다 -->
       <footer class="bottom-dock">
+        <div class="dock-tray">
+          ${COLORS.map((c) => {
+            const left = state.bank[c];
+            const picked = selectedTokens.filter((t) => t === c).length;
+            return `
+            <button class="tray-ball ${c} ${picked ? "picked" : ""} ${left < 1 ? "depleted" : ""}"
+                    data-token="${c}"
+                    ${!myTurn || left < 1 ? "disabled" : ""}
+                    aria-label="${labels[c]} ${left}개 남음">
+              <span class="chip-ball ${c}"><span class="chip-dot"></span></span>
+              <span class="tray-left">${left}</span>
+              ${picked ? `<span class="tray-picked">${picked}</span>` : ""}
+            </button>`;
+          }).join("")}
+        </div>
+
         <div class="dock-container">
           <div class="dock-status">
             <div class="dock-turn-info">
               <b>${current().name}</b>의 차례
-              ${!isMine() ? `<span class="dock-wait-pill">상대 수 계산 중...</span>` : ""}
+              ${!isMine() ? `<span class="dock-wait-pill">대기 중…</span>` : ""}
             </div>
             <div class="dock-selected-tokens">
               선택한 볼: <strong>${selectedTokens.map((c) => labels[c]).join(" / ") || "없음"}</strong>
@@ -787,15 +1073,19 @@ function renderBoard() {
 
           <div class="dock-actions">
             <button id="take-tokens" class="action-btn primary"
-                    ${!selectedTokens.length || !isMine() || state.pending || state.finished ? "disabled" : ""}>
-              선택 볼 획득 (${selectedTokens.length}개)
+                    ${!selectedTokens.length || !myTurn ? "disabled" : ""}>
+              ⚪ 볼 획득 (${selectedTokens.length})
             </button>
-            <div class="dock-hint">카드의 <b>⚡잡기</b> · <b>🎒보관</b> 버튼으로 행동하세요</div>
+            <button id="clear-tokens" class="action-btn ghost" ${!selectedTokens.length ? "disabled" : ""}>
+              선택 해제
+            </button>
           </div>
         </div>
       </footer>
 
+      ${cardSheetMarkup()}
       ${tutModalHtml}
+      ${settingsMarkup()}
     </section>
   `;
   bind();
@@ -829,7 +1119,7 @@ function renderTui() {
           <div class="tui-tokens">
             ${COLORS.map(
               (c) => `
-              <button data-token="${c}" ${!isMine() || state.pending || state.finished ? "disabled" : ""}>
+              <button data-token="${c}" ${!isMine() || state.pending || state.finished || state.bank[c] < 1 ? "disabled" : ""}>
                 [${labels[c]} ${state.bank[c]}]
               </button>
             `
@@ -1035,8 +1325,10 @@ function renderSetup() {
     session.seat = 0;
     startGame(soloSettings.playerCount, true);
   });
-  document.querySelector("#start")?.addEventListener("click", () => connect("create", onlineCount));
-  document.querySelector("#join")?.addEventListener("click", () => connect("join", document.querySelector("#room-code").value));
+  document.querySelector("#start")?.addEventListener("click", () => connect({ type: "create", playerCount: onlineCount }));
+  document.querySelector("#join")?.addEventListener("click", () =>
+    connect({ type: "join", code: document.querySelector("#room-code").value })
+  );
 
   bindTutorialEvents();
 }
@@ -1061,51 +1353,197 @@ function renderLobby() {
   });
 }
 
-function connect(type, value) {
-  const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`);
+function socketUrl() {
+  return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws`;
+}
+
+function setLink(next) {
+  if (session.link === next) return;
+  session.link = next;
+  if (state) render();
+}
+
+/**
+ * 서버와의 연결을 연다.
+ * intent: { type: "create", playerCount } | { type: "join", code } | { type: "resume", code, seat, token }
+ */
+function connect(intent) {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  // 이전 소켓이 살아 있으면 정리하고 새로 연다
+  if (session.socket) {
+    const stale = session.socket;
+    session.socket = null;
+    stale.onclose = null;
+    try {
+      stale.close();
+    } catch {
+      /* 무시 */
+    }
+  }
+
+  setLink(intent.type === "resume" ? "reconnecting" : "connecting");
+
+  let socket;
+  try {
+    socket = new WebSocket(socketUrl());
+  } catch {
+    scheduleReconnect();
+    return;
+  }
   session.socket = socket;
-  session.host = type === "create";
+  if (intent.type !== "resume") session.host = intent.type === "create";
+
   socket.addEventListener("open", () => {
-    socket.send(JSON.stringify(type === "create" ? { type, playerCount: value } : { type, code: value }));
+    reconnectAttempt = 0;
+    socket.send(JSON.stringify(intent));
   });
+
   socket.addEventListener("message", ({ data }) => {
-    const message = JSON.parse(data);
-    if (message.type === "error") {
-      alert(message.message);
-      session.socket = null;
-      renderSetup();
+    let message;
+    try {
+      message = JSON.parse(data);
+    } catch {
+      return;
     }
-    if (message.type === "welcome") {
-      session.online = true;
-      session.code = message.code;
-      session.seat = message.seat;
-      session.capacity = message.capacity;
-      session.connected = message.snapshot ? message.capacity : 1;
-      if (message.snapshot) {
-        state = message.snapshot;
-        render();
-      } else {
-        renderLobby();
-      }
-    }
-    if (message.type === "presence") {
-      session.connected = message.connected;
-      session.capacity = message.capacity;
-      if (session.host && !state && session.connected === session.capacity) {
-        startGame(session.capacity, false);
-      } else if (!state) {
-        renderLobby();
-      }
-    }
-    if (message.type === "snapshot") {
-      state = message.snapshot;
-      selectedTokens = [];
-      reserveMode = false;
-      returnSelection = {};
-      render();
-    }
+    handleServerMessage(message);
+  });
+
+  socket.addEventListener("close", () => {
+    if (session.socket !== socket) return;
+    session.socket = null;
+    if (!session.online) return;
+    setLink("reconnecting");
+    scheduleReconnect();
+  });
+
+  socket.addEventListener("error", () => {
+    // close 이벤트가 뒤따르므로 여기서는 상태만 표시한다
+    if (session.socket === socket && session.online) setLink("reconnecting");
   });
 }
+
+/** 끊긴 연결을 되살린다. 처음 몇 번은 거의 즉시 시도해 1초 안에 복구되도록 한다. */
+function scheduleReconnect() {
+  if (reconnectTimer || !session.online) return;
+  const saved = session.token ? { code: session.code, seat: session.seat, token: session.token } : loadSession();
+  if (!saved) {
+    setLink("lost");
+    return;
+  }
+  const backoff = [0, 250, 500, 1000, 2000, 4000];
+  const wait = backoff[Math.min(reconnectAttempt, backoff.length - 1)];
+  reconnectAttempt += 1;
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    connect({ type: "resume", code: saved.code, seat: saved.seat, token: saved.token });
+  }, wait);
+}
+
+function applySnapshot(snapshot, revision) {
+  if (!snapshot) return;
+  // 뒤처진 스냅샷이 늦게 도착해 최신 상태를 덮어쓰지 않도록 한다
+  if (typeof revision === "number" && revision < session.revision) return;
+  if (typeof revision === "number") session.revision = revision;
+  state = snapshot;
+  selectedTokens = [];
+  reserveMode = false;
+  returnSelection = {};
+  render();
+  maybeShowResult();
+}
+
+function handleServerMessage(message) {
+  if (message.type === "error") {
+    session.online = false;
+    session.socket = null;
+    clearSession();
+    setLink("online");
+    alert(message.message);
+    renderSetup();
+    return;
+  }
+
+  if (message.type === "resume-failed") {
+    // 자리가 이미 회수됐다. 조용히 실패하지 않고 명확히 알린다.
+    session.online = false;
+    clearSession();
+    setLink("lost");
+    render();
+    return;
+  }
+
+  if (message.type === "welcome") {
+    session.online = true;
+    session.code = message.code;
+    session.seat = message.seat;
+    session.token = message.token;
+    session.capacity = message.capacity;
+    session.revision = message.revision || 0;
+    reconnectAttempt = 0;
+    saveSession();
+    setLink("online");
+
+    if (message.snapshot) {
+      applySnapshot(message.snapshot, message.revision);
+    } else if (message.resumed) {
+      // 서버에 아직 스냅샷이 없다면 직접 요청해 본다
+      requestSync();
+    } else {
+      renderLobby();
+    }
+    return;
+  }
+
+  if (message.type === "presence") {
+    session.connected = message.connected;
+    session.capacity = message.capacity;
+    session.seatStates = message.seats || [];
+    if (session.host && !state && session.connected === session.capacity) {
+      startGame(session.capacity, false);
+    } else if (!state) {
+      renderLobby();
+    } else {
+      render();
+    }
+    return;
+  }
+
+  if (message.type === "snapshot") {
+    applySnapshot(message.snapshot, message.revision);
+  }
+}
+
+function requestSync() {
+  if (session.socket?.readyState === WebSocket.OPEN) {
+    session.socket.send(JSON.stringify({ type: "sync-request" }));
+  }
+}
+
+/** 화면 복귀·네트워크 복구 시 지체 없이 따라잡는다. */
+function watchConnection() {
+  const revive = () => {
+    if (!session.online) return;
+    if (session.socket?.readyState === WebSocket.OPEN) {
+      // 연결은 살아 있어도 백그라운드에서 놓친 갱신이 있을 수 있다
+      requestSync();
+      return;
+    }
+    reconnectAttempt = 0;
+    scheduleReconnect();
+  };
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") revive();
+  });
+  window.addEventListener("focus", revive);
+  window.addEventListener("online", revive);
+  window.addEventListener("pageshow", revive);
+}
+
+watchConnection();
 
 function bindTutorialEvents() {
   document.querySelector("#tut-close")?.addEventListener("click", () => {
@@ -1142,6 +1580,7 @@ function bind() {
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
       session.view = button.dataset.view;
+      session.settingsOpen = false;
       render();
     });
   });
@@ -1151,8 +1590,18 @@ function bind() {
       clearTimeout(cpuTimer);
       cpuTimer = null;
     }
+    if (session.online) {
+      clearSession();
+      session.online = false;
+      session.token = null;
+      try {
+        session.socket?.close();
+      } catch {
+        /* 무시 */
+      }
+      session.socket = null;
+    }
     state = null;
-    session.online = false;
     render();
   });
 
@@ -1163,21 +1612,98 @@ function bind() {
     });
   });
 
+  document.querySelectorAll("[data-mytab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      session.myTab = btn.dataset.mytab;
+      render();
+    });
+  });
+
+  // 모바일 요약 바를 누르면 내 현황 탭으로 바로 이동
+  document.querySelector("#mobile-me")?.addEventListener("click", () => {
+    session.mobileTab = "my";
+    render();
+  });
+
+  document.querySelector("#clear-tokens")?.addEventListener("click", () => {
+    selectedTokens = [];
+    render();
+  });
+
+  // 모바일에서는 카드를 누르면 바텀시트가 열린다 (좁은 화면에서 작은 버튼을 겨냥하지 않아도 되도록)
+  document.querySelectorAll("[data-card-root]").forEach((card) => {
+    card.addEventListener("click", (event) => {
+      if (event.target.closest(".card-act")) return;
+      if (!window.matchMedia("(max-width: 768px)").matches) return;
+      session.cardSheet = card.dataset.cardRoot;
+      fx.unlockAudio();
+      fx.play("tokenPick");
+      render();
+    });
+  });
+
+  const closeSheet = () => {
+    session.cardSheet = null;
+    render();
+  };
+  document.querySelector("#card-sheet-close")?.addEventListener("click", closeSheet);
+  document.querySelector("#card-sheet-backdrop")?.addEventListener("click", (event) => {
+    if (event.target.id === "card-sheet-backdrop") closeSheet();
+  });
+
   document.querySelector("#open-rulebook")?.addEventListener("click", () => {
     session.tutorialStep = 0;
     render();
   });
 
-  document.querySelector("#toggle-sound")?.addEventListener("click", () => {
-    fx.setMuted(!fx.isMuted());
+  document.querySelector("#open-settings")?.addEventListener("click", () => {
     fx.unlockAudio();
-    if (!fx.isMuted()) fx.play("tokenPick");
+    session.settingsOpen = true;
     render();
   });
 
-  document.querySelector("#toggle-cpu-speed")?.addEventListener("click", () => {
-    const idx = CPU_SPEED_ORDER.indexOf(soloSettings.cpuSpeed);
-    soloSettings.cpuSpeed = CPU_SPEED_ORDER[(idx + 1) % CPU_SPEED_ORDER.length];
+  const closeSettings = () => {
+    session.settingsOpen = false;
+    render();
+  };
+  document.querySelector("#settings-close")?.addEventListener("click", closeSettings);
+  document.querySelector("#settings-backdrop")?.addEventListener("click", (event) => {
+    if (event.target.id === "settings-backdrop") closeSettings();
+  });
+
+  document.querySelectorAll("[data-audio]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const kind = button.dataset.audio;
+      const prefs = fx.getAudioPrefs();
+      fx.unlockAudio();
+      if (kind === "bgm") fx.setBgmEnabled(!prefs.bgm);
+      else {
+        fx.setSfxEnabled(!prefs.sfx);
+        if (!prefs.sfx) fx.play("tokenTake");
+      }
+      render();
+    });
+  });
+
+  document.querySelectorAll("[data-speed]").forEach((button) => {
+    button.addEventListener("click", () => {
+      soloSettings.cpuSpeed = button.dataset.speed;
+      render();
+    });
+  });
+
+  document.querySelector("#link-retry")?.addEventListener("click", () => {
+    reconnectAttempt = 0;
+    session.online = true;
+    scheduleReconnect();
+    setLink("reconnecting");
+  });
+
+  document.querySelector("#link-home")?.addEventListener("click", () => {
+    clearSession();
+    session.online = false;
+    session.token = null;
+    state = null;
     render();
   });
 
@@ -1185,7 +1711,8 @@ function bind() {
     button.addEventListener("click", () => {
       const color = button.dataset.token;
       if (selectedTokens.length === 1 && selectedTokens[0] === color) {
-        selectedTokens = state.bank[color] >= 4 ? [color, color] : [];
+        const threshold = perk(current(), "sameColorThreshold", 4);
+        selectedTokens = state.bank[color] >= threshold ? [color, color] : [];
       } else if (selectedTokens.length === 2 && selectedTokens.every((v) => v === color)) {
         selectedTokens = [];
       } else if (selectedTokens.includes(color)) {
@@ -1289,8 +1816,45 @@ function bind() {
 
 function refreshTokenSelection() {
   document.querySelectorAll("[data-token]").forEach((button) => {
-    button.classList.toggle("selected-token", selectedTokens.includes(button.dataset.token));
+    const color = button.dataset.token;
+    const picked = selectedTokens.filter((t) => t === color).length;
+    // 공급처 패널과 하단 트레이가 같은 선택 상태를 공유한다
+    button.classList.toggle("selected-token", picked > 0);
+    button.classList.toggle("picked", picked > 0);
+
+    const trayBadge = button.querySelector(".tray-picked");
+    if (button.classList.contains("tray-ball")) {
+      if (picked > 0) {
+        if (trayBadge) trayBadge.textContent = String(picked);
+        else {
+          const badge = document.createElement("span");
+          badge.className = "tray-picked";
+          badge.textContent = String(picked);
+          button.appendChild(badge);
+        }
+      } else if (trayBadge) {
+        trayBadge.remove();
+      }
+    }
+
+    const supplyBadge = button.querySelector(".ball-picked");
+    if (button.classList.contains("ball-token-btn")) {
+      if (picked > 0) {
+        if (supplyBadge) supplyBadge.textContent = `+${picked}`;
+        else {
+          const badge = document.createElement("span");
+          badge.className = "ball-picked";
+          badge.textContent = `+${picked}`;
+          button.appendChild(badge);
+        }
+      } else if (supplyBadge) {
+        supplyBadge.remove();
+      }
+    }
   });
+
+  const clear = document.querySelector("#clear-tokens");
+  if (clear) clear.disabled = !selectedTokens.length;
   const selected = selectedTokens.map((c) => labels[c]).join(" / ") || "없음";
   const summary =
     document.querySelector(".dock-selected-tokens strong") || document.querySelector(".my-board span:last-child");
@@ -1298,7 +1862,7 @@ function refreshTokenSelection() {
   const take = document.querySelector("#take-tokens");
   if (take) {
     take.disabled = !selectedTokens.length || !isMine() || Boolean(state.pending) || state.finished;
-    take.textContent = `선택 볼 획득 (${selectedTokens.length}개)`;
+    take.textContent = `⚪ 볼 획득 (${selectedTokens.length})`;
   }
 }
 
@@ -1381,4 +1945,18 @@ window.render_game_to_text = () =>
   });
 
 window.advanceTime = () => render();
-render();
+
+// 새로고침이나 탭 복귀로 앱이 다시 뜬 경우, 진행 중이던 온라인 세션을 자동 복구한다.
+function restoreSessionOnBoot() {
+  const saved = loadSession();
+  if (!saved) return false;
+  session.online = true;
+  session.code = saved.code;
+  session.seat = saved.seat;
+  session.token = saved.token;
+  connect({ type: "resume", code: saved.code, seat: saved.seat, token: saved.token });
+  return true;
+}
+
+if (!restoreSessionOnBoot()) render();
+else render();
